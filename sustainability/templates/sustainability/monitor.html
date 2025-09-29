@@ -1,0 +1,230 @@
+{# sustainability/templates/sustainability/monitor.html #}
+{% extends "admin/base_site.html" %}
+{% load static tz %}
+{% get_current_timezone as TIME_ZONE %}
+
+{% block title %}Sustainability{% endblock %}
+{% block content %}
+<div class="app-sustainability">
+  <h1>Sustainability</h1>
+  <p>Your server uses resources to run Django & your site. Monitoring helps optimize your installation.</p>
+  <p>
+    You need the <a href="https://github.com/green-kernel/procpower" target="_blank" rel="noopener">ProcPower</a>
+    kernel extension on the host system. This page reads
+    <code>{{ energy_file }}</code> once per second and graphs per-PID <code>energy</code> values.
+  </p>
+
+  <div id="wp-sustainability-status" style="margin:8px 0; font-weight:600;">
+    Status: <span id="wp-sustainability-status-text">Initializing…</span>
+  </div>
+
+  <div style="display:flex; gap:24px; align-items:flex-start; flex-wrap:wrap;">
+    <div style="flex:1 1 700px; min-width:360px;">
+      <canvas id="wp-sustainability-chart" height="260"></canvas>
+    </div>
+    <div style="flex:1 1 420px; min-width:320px;">
+      <div style="background:#fff;border:1px solid #ccd0d4;border-radius:6px;padding:12px;">
+        <h2 style="margin-top:0;">Latest readings (per PID)</h2>
+        <div><strong>Timestamp:</strong> <span id="wp-sustainability-ts">—</span></div>
+        <div style="margin-top:8px;overflow:auto;max-height:360px;">
+          <table class="widefat striped" style="margin-top:8px; width:100%;">
+            <thead>
+              <tr>
+                <th>PID</th>
+                <th>comm</th>
+                <th style="text-align:right;">energy (kWh)</th>
+              </tr>
+            </thead>
+            <tbody id="wp-sustainability-table-body">
+              <tr><td colspan="3">—</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <details style="margin-top:12px;">
+          <summary>Raw file</summary>
+          <pre id="wp-sustainability-raw" style="background:#f6f7f7;padding:8px;border-radius:4px;overflow:auto;max-height:180px;">—</pre>
+        </details>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- CSRF token for AJAX -->
+<input type="hidden" id="csrf-token" value="{{ csrf_token }}">
+
+<!-- Chart.js from CDN -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+<script>
+(function start(){
+'use strict';
+
+function getCookie(name) {
+  const value = document.cookie.match('(^|;)\\s*' + name + '\\s*=\\s*([^;]+)');
+  return value ? value.pop() : '';
+}
+
+function init() {
+  const elStatus = document.getElementById('wp-sustainability-status-text');
+  const elTS = document.getElementById('wp-sustainability-ts');
+  const elRaw = document.getElementById('wp-sustainability-raw');
+  const elTableBody = document.getElementById('wp-sustainability-table-body');
+  const canvas = document.getElementById('wp-sustainability-chart');
+
+  if (!canvas) { if (elStatus) elStatus.textContent = 'Error: chart canvas not found'; return; }
+  if (typeof Chart === 'undefined') { if (elStatus) elStatus.textContent = 'Error: Chart.js not loaded'; return; }
+
+  const ctx = canvas.getContext('2d');
+  const labels = [];
+  const seriesByPid = new Map();
+  let tickCount = 0;
+  let timer = null;
+
+  const chart = new Chart(ctx, {
+    type: 'line',
+    data: { labels, datasets: [] },
+    options: {
+      animation: false,
+      responsive: true,
+      parsing: true,
+      interaction: { mode: 'nearest', intersect: false },
+      scales: {
+        x: { ticks: { maxRotation: 0, autoSkip: true }, grid: { display: false } },
+        y: { beginAtZero: false }
+      },
+      plugins: { legend: { display: true } }
+    }
+  });
+
+  function fmtClock(ts) {
+    const d = new Date(ts * 1000);
+    return d.toLocaleTimeString([], { hour12: false });
+  }
+
+  function ensureDataset(pid, comm) {
+    if (seriesByPid.has(pid)) {
+      const s = seriesByPid.get(pid);
+      const want = `${comm} (pid ${pid})`;
+      if (s.dataset.label !== want) s.dataset.label = want;
+      return s;
+    }
+    const ds = {
+      label: `${comm} (pid ${pid})`,
+      data: [],
+      tension: 0.2,
+      pointRadius: 0,
+      borderWidth: 2,
+      spanGaps: true
+    };
+    for (let i = 0; i < labels.length; i++) ds.data.push(null);
+    chart.data.datasets.push(ds);
+    const entry = { dataset: ds, lastSeenTick: -1, seenThisTick: false };
+    seriesByPid.set(pid, entry);
+    return entry;
+  }
+
+  function pushTick(timestamp, entries) {
+    labels.push(fmtClock(timestamp));
+    tickCount++;
+
+    for (const s of seriesByPid.values()) s.seenThisTick = false;
+
+    for (const e of entries) {
+      const pid = e.pid;
+      const comm = e.comm;
+      const energy = (typeof e.energy === 'number' && isFinite(e.energy)) ? e.energy : null;
+      const s = ensureDataset(pid, comm);
+      s.dataset.data.push(energy);
+      s.lastSeenTick = tickCount;
+      s.seenThisTick = true;
+    }
+
+    for (const s of seriesByPid.values()) {
+      if (!s.seenThisTick) s.dataset.data.push(null);
+    }
+
+    const maxPoints = 300;
+    if (labels.length > maxPoints) {
+      const drop = labels.length - maxPoints;
+      labels.splice(0, drop);
+      for (const s of seriesByPid.values()) {
+        s.dataset.data.splice(0, drop);
+      }
+    }
+
+    chart.update('none');
+  }
+
+  function renderTable(entries) {
+    const rows = entries
+      .slice()
+      .sort((a, b) => (b.energy || 0) - (a.energy || 0))
+      .map(e => {
+        const pid = String(e.pid);
+        const comm = String(e.comm);
+        const energy = (e.energy != null && isFinite(e.energy)) ? e.energy.toFixed(3) : '—';
+        return (
+          '<tr>' +
+          '<td>' + pid + '</td>' +
+          '<td>' + comm + '</td>' +
+          '<td style="text-align:right;">' + energy + '</td>' +
+          '</tr>'
+        );
+      });
+
+    elTableBody.innerHTML = rows.join('') || '<tr><td colspan="3">No entries</td></tr>';
+  }
+
+  async function tick() {
+    try {
+      const csrf = getCookie('csrftoken') || document.getElementById('csrf-token')?.value || '';
+      const res = await fetch("{% url 'sustainability-energy' %}", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          "X-CSRFToken": csrf
+        },
+        body: "",
+        credentials: "same-origin",
+        cache: "no-store"
+      });
+
+      const payload = await res.json();
+
+      if (!payload || (payload.success !== true && payload.success !== false)) {
+        throw new Error('Unexpected response');
+      }
+
+      if (!payload.success) {
+        if (elStatus) elStatus.textContent = 'Error: ' + (payload.data && payload.data.message ? payload.data.message : 'Unknown');
+        if (payload.data && payload.data.raw && elRaw) elRaw.textContent = payload.data.raw;
+        return;
+      }
+
+      const { timestamp, entries, raw } = payload.data;
+
+      if (elStatus) elStatus.textContent = 'OK';
+      if (elTS) elTS.textContent = new Date(timestamp * 1000).toLocaleString();
+      if (elRaw) elRaw.textContent = raw;
+
+      pushTick(timestamp, entries);
+      renderTable(entries);
+    } catch (e) {
+      if (elStatus) elStatus.textContent = 'Fetch error: ' + e.message;
+    }
+  }
+
+  tick();
+  const interval = 1000;
+  timer = setInterval(tick, interval);
+  window.addEventListener('beforeunload', () => clearInterval(timer));
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', init, {once:true});
+} else {
+  init();
+}
+})();
+</script>
+{% endblock %}

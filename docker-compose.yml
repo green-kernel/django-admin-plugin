@@ -1,0 +1,16 @@
+services:
+  web:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DJANGO_SUPERUSER_USERNAME: admin
+      DJANGO_SUPERUSER_EMAIL: admin@example.com
+      DJANGO_SUPERUSER_PASSWORD: admin
+      DJANGO_DEBUG: "1"
+      DJANGO_SECRET_KEY: "dev-secret-key-change-me"
+      DJANGO_ALLOWED_HOSTS: "*"
+    # Enable this if you want to write code
+    # volumes:
+    #   - .:/app:Z
+    command: ["/app/entrypoint.sh"]
